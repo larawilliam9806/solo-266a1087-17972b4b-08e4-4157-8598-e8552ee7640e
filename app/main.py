@@ -15,11 +15,35 @@ is *not* released by that success, and the slow first attempt keeps holding
 its own slot until it returns.  This is intentional: "即使结果已可下载，仍在
 运行的副本也占用槽位".
 
-Dispatch priority, checked every tick and whenever a slot frees:
+Global pixel budget
+-------------------
+Decoding several large base maps at once is what actually drives peak memory,
+not the compressed upload size.  A second global limit, ``MAX_PIXELS`` (set
+with ``THUMBNAIL_MAX_PIXELS``), therefore caps the total number of
+``width * height`` source pixels whose decodes are in flight at any moment.
+Upload validation, the first render and every make-up retry draw from the
+*same* budget: before each decode the caller reserves ``width * height``
+pixels, and the reservation is returned only when that piece of work has
+actually finished -- success or failure alike.
 
-1. Jobs that have never been executed (``pending``) -- oldest first.
+* A single image whose pixel count exceeds the whole limit can never fit; the
+  upload endpoint rejects the entire batch in that case.
+* Validation waits (without blocking status queries or thumbnail downloads)
+  until enough of the budget is free, then decodes.
+* A render attempt only "starts" once it holds both a pixel reservation and
+  an execution slot.
+
+Dispatch priority, checked every tick, whenever a slot frees and whenever
+pixel budget is returned:
+
+1. Jobs that have never been executed (``pending``) -- oldest first, skipping
+   jobs that do not fit the pixel budget currently free.
 2. A single make-up attempt for a job whose first attempt is still running
-   past the threshold -- oldest first, at most one retry per job.
+   past the threshold -- oldest first, at most one retry per job, and only if
+   the pixel budget still has room for it.
+
+   When a slot is free, pending jobs that fit are dispatched first in queue
+   order; only if no pending job fits may an eligible retry be dispatched.
 
 Delivery rules:
 
@@ -49,6 +73,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response
+from fastapi.concurrency import run_in_threadpool
 from PIL import Image, UnidentifiedImageError
 
 
@@ -95,6 +120,9 @@ class Settings:
     max_edge: int = field(default_factory=lambda: max(1, _env_int("THUMBNAIL_MAX_EDGE", 256)))
     # Max bytes per uploaded file; 0 disables the check.
     max_upload_bytes: int = field(default_factory=lambda: _env_int("THUMBNAIL_MAX_UPLOAD_BYTES", 0))
+    # Global cap on source pixels (width * height) whose decodes are in flight
+    # at once, shared by upload validation and every render attempt.
+    max_pixels: int = field(default_factory=lambda: max(1, _env_int("THUMBNAIL_MAX_PIXELS", 50_000_000)))
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +152,9 @@ class AttemptState(str, Enum):
 class Attempt:
     kind: AttemptKind
     started_at: float
+    # Source pixels (width * height) reserved from the global budget for this
+    # attempt; held until the attempt actually finishes.
+    pixels: int = 0
     state: AttemptState = AttemptState.RUNNING
     finished_at: Optional[float] = None
     error: Optional[str] = None
@@ -134,6 +165,7 @@ class Attempt:
             "state": self.state.value,
             "started_at": _iso(self.started_at),
             "finished_at": _iso(self.finished_at) if self.finished_at is not None else None,
+            "pixels": self.pixels,
             "error": self.error,
         }
 
@@ -143,6 +175,8 @@ class Job:
     job_id: str
     filename: str
     data: Optional[bytes]
+    # Source pixel count of the original image (width * height).
+    pixels: int = 0
     state: JobState = JobState.PENDING
     attempts: List[Attempt] = field(default_factory=list)
     result: Optional[bytes] = None
@@ -212,10 +246,18 @@ class ThumbnailService:
     ):
         self.settings = settings
         self._render = renderer or render_thumbnail
-        self._lock = threading.RLock()
+        # A plain Lock (not RLock): the Condition below relies on wait()
+        # actually releasing the lock, and no code path re-enters it.
+        self._lock = threading.Lock()
+        # Signalled whenever pixel budget is returned, so validation waiting
+        # on the budget can wake and re-check.
+        self._condition = threading.Condition(self._lock)
         self._batches: Dict[str, Batch] = {}
         self._jobs: Dict[str, Job] = {}
         self._in_flight = 0
+        # Pixels currently reserved from the global budget (validation plus
+        # every running render attempt).
+        self._pixels_used = 0
         self._executor = ThreadPoolExecutor(
             max_workers=settings.slot_count, thread_name_prefix="thumb"
         )
@@ -229,6 +271,9 @@ class ThumbnailService:
 
     def shutdown(self) -> None:
         self._stop.set()
+        with self._lock:
+            # Release any thread still waiting for pixel budget.
+            self._condition.notify_all()
         self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _ticker_loop(self) -> None:
@@ -236,22 +281,81 @@ class ThumbnailService:
             with self._lock:
                 self._dispatch_locked()
 
+    # -- pixel budget ------------------------------------------------------
+
+    def _acquire_budget_locked(self, pixels: int) -> None:
+        """Wait until ``pixels`` source pixels can be reserved.
+
+        Called with the service lock held; releases it while waiting.  The
+        reservation is made before every decode and returned only once that
+        piece of work has actually finished.
+        """
+        while self._pixels_used + pixels > self.settings.max_pixels:
+            if self._stop.is_set():
+                raise RuntimeError("service is shutting down")
+            self._condition.wait(timeout=1.0)
+
+    def _release_budget(self, pixels: int) -> None:
+        if pixels <= 0:
+            return
+        with self._lock:
+            self._pixels_used -= pixels
+            # Wake validation waiting on the budget; the ticker keeps trying
+            # dispatch on its own, but nudge it immediately as well.
+            self._condition.notify_all()
+            self._dispatch_locked()
+
     # -- ingestion ---------------------------------------------------------
 
     def create_batch(self, uploads: List[Tuple[str, bytes]]) -> Batch:
-        """Validate every file, then register the batch atomically."""
-        validated = [(name, data) for name, data in (self._validate(*u) for u in uploads)]
+        """Validate every file, then register the batch atomically.
+
+        Phase one only parses PNG headers (no full decode, no budget): it
+        rejects empty/oversized/non-PNG files and any single image whose
+        ``width * height`` exceeds the global pixel limit -- such an image
+        could never fit, so the whole batch is refused up front.
+
+        Phase two performs the full decodes.  Each one first reserves its
+        source pixels from the shared global budget, waiting while the budget
+        is exhausted; the reservation is held until that validation decode
+        finishes, succeed or fail.
+        """
+        # Phase 1: header-only prechecks for every file (no budget touched).
+        checked: List[Tuple[str, bytes, int]] = [
+            self._precheck(filename, data) for filename, data in uploads
+        ]
+
+        # Phase 2: full validation decodes, each under its own reservation.
+        validated: List[Tuple[str, bytes, int]] = []
+        for filename, data, pixels in checked:
+            with self._lock:
+                self._acquire_budget_locked(pixels)
+                self._pixels_used += pixels
+            try:
+                self._decode_for_validation(filename, data)
+            finally:
+                # Validation owns this reservation only until its decode
+                # actually ends; render attempts reserve separately.
+                self._release_budget(pixels)
+            validated.append((filename, data, pixels))
+
         batch = Batch(batch_id=uuid.uuid4().hex, created_at=time.time())
         with self._lock:
             self._batches[batch.batch_id] = batch
-            for filename, data in validated:
-                job = Job(job_id=secrets.token_hex(8), filename=filename, data=data)
+            for filename, data, pixels in validated:
+                job = Job(
+                    job_id=secrets.token_hex(8),
+                    filename=filename,
+                    data=data,
+                    pixels=pixels,
+                )
                 batch.job_ids.append(job.job_id)
                 self._jobs[job.job_id] = job
             self._dispatch_locked()
         return batch
 
-    def _validate(self, filename: str, data: bytes) -> Tuple[str, bytes]:
+    def _precheck(self, filename: str, data: bytes) -> Tuple[str, bytes, int]:
+        """Header-only checks; return (filename, data, source_pixels)."""
         if not data:
             raise JobRejected(f"{filename}: empty file")
         limit = self.settings.max_upload_bytes
@@ -259,16 +363,30 @@ class ThumbnailService:
             raise JobRejected(f"{filename}: {len(data)} bytes exceeds limit of {limit}")
         try:
             with Image.open(io.BytesIO(data)) as probe:
-                probe.verify()
-            with Image.open(io.BytesIO(data)) as probe:
                 if probe.format != "PNG":
                     raise JobRejected(f"{filename}: not a PNG image")
-                probe.load()
+                width, height = probe.size
         except JobRejected:
             raise
         except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
             raise JobRejected(f"{filename}: invalid PNG ({exc})") from exc
-        return filename, data
+        pixels = width * height
+        if pixels > self.settings.max_pixels:
+            raise JobRejected(
+                f"{filename}: {pixels} pixels ({width}x{height}) exceeds global "
+                f"pixel limit of {self.settings.max_pixels}"
+            )
+        return filename, data, pixels
+
+    def _decode_for_validation(self, filename: str, data: bytes) -> None:
+        """Full decode under a budget already reserved by the caller."""
+        try:
+            with Image.open(io.BytesIO(data)) as probe:
+                probe.verify()
+            with Image.open(io.BytesIO(data)) as probe:
+                probe.load()
+        except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
+            raise JobRejected(f"{filename}: invalid PNG ({exc})") from exc
 
     # -- scheduling --------------------------------------------------------
 
@@ -280,16 +398,21 @@ class ThumbnailService:
             self._start_attempt_locked(job, kind)
 
     def _pick_next_locked(self) -> Tuple[Optional[Job], Optional[AttemptKind]]:
-        # 1) Never-executed jobs win every free slot, oldest first.
+        # 1) Never-executed jobs win every free slot, oldest first.  A job
+        #    whose pixels do not fit the budget currently free is skipped, so
+        #    a fitting job behind it is not blocked by it.
         for job in self._jobs.values():
-            if job.state is JobState.PENDING:
+            if job.state is JobState.PENDING and self._fits_budget_locked(job.pixels):
                 return job, AttemptKind.FIRST
 
-        # 2) Only with nothing pending: one make-up attempt for a first
-        #    attempt that is still running past the threshold.
+        # 2) Only with no fitting pending job: one make-up attempt for a
+        #    first attempt that is still running past the threshold, and only
+        #    if the pixel budget still has room for it.
         now = time.time()
         for job in self._jobs.values():
             if job.state is not JobState.RUNNING or job.retry_dispatched:
+                continue
+            if not self._fits_budget_locked(job.pixels):
                 continue
             first = job.attempts[0]
             if first.state is AttemptState.RUNNING and (
@@ -298,11 +421,17 @@ class ThumbnailService:
                 return job, AttemptKind.RETRY
         return None, None
 
+    def _fits_budget_locked(self, pixels: int) -> bool:
+        return self._pixels_used + pixels <= self.settings.max_pixels
+
     def _start_attempt_locked(self, job: Job, kind: AttemptKind) -> None:
-        attempt = Attempt(kind=kind, started_at=time.time())
+        # An attempt only starts once it holds both its pixel reservation and
+        # an execution slot.  Callers (_pick_next_locked) guarantee the fit.
+        attempt = Attempt(kind=kind, started_at=time.time(), pixels=job.pixels)
         job.attempts.append(attempt)
         job.state = JobState.RUNNING if kind is AttemptKind.FIRST else JobState.RETRYING
         self._in_flight += 1
+        self._pixels_used += job.pixels
         self._executor.submit(self._run_attempt, job.job_id, attempt)
 
     # -- execution ---------------------------------------------------------
@@ -364,6 +493,10 @@ class ThumbnailService:
             if not job.has_running_attempt:
                 job.data = None  # release the original payload
             self._in_flight -= 1
+            # The reservation is returned only now that this attempt has
+            # actually finished, whether it succeeded or failed.
+            self._pixels_used -= attempt.pixels
+            self._condition.notify_all()
             self._dispatch_locked()
 
     # -- queries -----------------------------------------------------------
@@ -407,6 +540,9 @@ class ThumbnailService:
                 "slot_count": self.settings.slot_count,
                 "in_flight": self._in_flight,
                 "free_slots": self.settings.slot_count - self._in_flight,
+                "max_pixels": self.settings.max_pixels,
+                "pixels_used": self._pixels_used,
+                "pixels_free": self.settings.max_pixels - self._pixels_used,
                 "retry_after_seconds": self.settings.retry_after_seconds,
                 "max_edge": self.settings.max_edge,
                 "jobs": counts,
@@ -418,6 +554,7 @@ class ThumbnailService:
             "job_id": job.job_id,
             "filename": job.filename,
             "state": job.state.value,
+            "pixels": job.pixels,
             "result_ready": ready,
             "attempts": [a.as_dict() for a in job.attempts],
             "result": None if not ready else {
@@ -479,7 +616,9 @@ def create_app(
                 await upload.close()
             payloads.append((upload.filename or "unnamed.png", data))
         try:
-            batch = service.create_batch(payloads)
+            # Runs in a worker thread: validation may wait for global pixel
+            # budget, which must not block batch queries or thumbnail reads.
+            batch = await run_in_threadpool(service.create_batch, payloads)
         except JobRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         snapshot = service.get_batch(batch.batch_id)

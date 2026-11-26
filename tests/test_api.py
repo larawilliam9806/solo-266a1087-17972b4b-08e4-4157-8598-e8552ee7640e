@@ -176,6 +176,96 @@ def test_http_stats_endpoint(client):
     assert stats["slot_count"] == 2
     assert stats["retry_after_seconds"] == 30.0
     assert stats["max_edge"] == 256
+    assert stats["max_pixels"] == 50_000_000
+    assert stats["pixels_used"] == 0
+    assert stats["pixels_free"] == stats["max_pixels"]
+
+
+def test_upload_rejects_batch_when_single_image_exceeds_pixel_limit():
+    app = create_app(
+        Settings(slot_count=2, retry_after_seconds=30.0, max_edge=256, max_pixels=999)
+    )
+    with TestClient(app) as limited_client:
+        # 40x30 = 1200 pixels > 999.
+        resp = limited_client.post(
+            "/batches",
+            files=[("files", ("huge.png", make_png((40, 30)), "image/png"))],
+        )
+        assert resp.status_code == 400
+        assert "huge.png" in resp.json()["detail"]
+        assert "pixel limit" in resp.json()["detail"]
+
+        # One oversized file rejects the whole batch, including the fitting one.
+        resp = limited_client.post(
+            "/batches",
+            files=[
+                ("files", ("small.png", make_png((10, 10)), "image/png")),
+                ("files", ("huge.png", make_png((40, 30)), "image/png")),
+            ],
+        )
+        assert resp.status_code == 400
+        assert limited_client.get("/stats").json()["jobs"] == {}
+        assert limited_client.get("/stats").json()["pixels_used"] == 0
+
+
+def test_queries_and_downloads_continue_while_validation_waits_for_budget():
+    # Every image is 10x10 = 100 pixels and the budget holds exactly one.
+    renderer = SlowishRenderer(slow_key="block", slow_seconds=1.0)
+    app = create_app(
+        Settings(slot_count=2, retry_after_seconds=30.0, max_edge=256, max_pixels=100),
+        renderer=renderer,
+    )
+    with TestClient(app) as limited_client:
+        resp = limited_client.post(
+            "/batches",
+            files=[
+                ("files", ("ready.png", png_with_key("ready", (10, 10)), "image/png")),
+                ("files", ("block.png", png_with_key("block", (10, 10)), "image/png")),
+            ],
+        )
+        assert resp.status_code == 201
+        first_batch = resp.json()["batch_id"]
+        jobs = {j["filename"]: j for j in resp.json()["jobs"]}
+        ready_id = jobs["ready.png"]["job_id"]
+
+        # "ready" finishes first; "block" then holds the whole budget.
+        wait_until(
+            lambda: limited_client.get(f"/jobs/{ready_id}").json()["result_ready"]
+        )
+        block_id = jobs["block.png"]["job_id"]
+        wait_until(
+            lambda: limited_client.get(f"/jobs/{block_id}").json()["state"]
+            == JobState.RUNNING.value
+        )
+        assert limited_client.get("/stats").json()["pixels_used"] == 100
+
+        upload_finished = threading.Event()
+
+        def upload_more() -> None:
+            limited_client.post(
+                "/batches",
+                files=[("files", ("wait.png", png_with_key("wait", (10, 10)), "image/png"))],
+            )
+            upload_finished.set()
+
+        worker = threading.Thread(target=upload_more)
+        worker.start()
+        time.sleep(0.3)
+        assert not upload_finished.is_set()  # its validation decode is waiting
+
+        # Existing batches stay queryable and produced thumbnails downloadable.
+        assert limited_client.get(f"/batches/{first_batch}").status_code == 200
+        thumb = limited_client.get(f"/jobs/{ready_id}/thumbnail")
+        assert thumb.status_code == 200
+        assert thumb.headers["x-thumbnail-origin"] == "first"
+        stats = limited_client.get("/stats").json()
+        assert stats["max_pixels"] == 100
+        assert stats["pixels_used"] == 100
+        assert stats["pixels_free"] == 0
+
+        worker.join(timeout=10)
+        assert upload_finished.is_set()
+        wait_until(lambda: limited_client.get("/stats").json()["pixels_used"] == 0)
 
 
 def test_http_healthz(client):

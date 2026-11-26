@@ -97,9 +97,14 @@ def wait_until(predicate, timeout: float = 5.0, interval: float = 0.01):
     raise AssertionError("condition not met before timeout")
 
 
-def make_service(renderer, slots=2, retry_after=10.0):
+def make_service(renderer, slots=2, retry_after=10.0, max_pixels=50_000_000):
     return ThumbnailService(
-        Settings(slot_count=slots, retry_after_seconds=retry_after, max_edge=256),
+        Settings(
+            slot_count=slots,
+            retry_after_seconds=retry_after,
+            max_edge=256,
+            max_pixels=max_pixels,
+        ),
         renderer=renderer,
     )
 
@@ -323,6 +328,330 @@ def test_global_slot_limit_never_exceeded():
         )
         assert renderer.max_active <= 2
         assert service.stats()["in_flight"] == 0
+    finally:
+        release_all(plans)
+        service.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Global pixel budget
+# ---------------------------------------------------------------------------
+
+def test_single_image_over_budget_rejects_whole_batch():
+    renderer = FakeRenderer()
+    # One 10x10 image is 100 pixels; the limit only allows 99.
+    service = make_service(renderer, slots=2, max_pixels=99)
+    try:
+        with pytest.raises(JobRejected) as exc_info:
+            service.create_batch([("huge.png", make_png("huge", size=(10, 10)))])
+        assert "huge.png" in str(exc_info.value)
+        assert "pixel limit" in str(exc_info.value)
+        assert service.stats()["jobs"] == {}
+        assert service.stats()["pixels_used"] == 0
+
+        # One bad apple rejects the entire batch, including the fitting file.
+        with pytest.raises(JobRejected):
+            service.create_batch(
+                [
+                    ("ok.png", make_png("ok", size=(3, 3))),
+                    ("huge.png", make_png("huge", size=(10, 10))),
+                ]
+            )
+        assert service.stats()["jobs"] == {}
+        assert service.stats()["pixels_used"] == 0
+        assert renderer.total_calls == 0
+    finally:
+        service.shutdown()
+
+
+def test_validation_waits_for_pixel_budget_then_continues():
+    renderer = FakeRenderer()
+    plans = {
+        "a": renderer.plan("a", 1),
+        "b": renderer.plan("b", 1),
+    }
+    # Budget holds exactly one 100-pixel image at a time.
+    service = make_service(renderer, slots=2, max_pixels=100)
+    try:
+        batch = service.create_batch([("a.png", make_png("a", size=(10, 10)))])
+        a_id = batch.job_ids[0]
+        wait_until(lambda: plans["a"][0].started.is_set())
+        # The running first attempt holds all 100 pixels.
+        stats = service.stats()
+        assert stats["pixels_used"] == 100
+        assert stats["pixels_free"] == 0
+
+        # A second upload's validation decode must wait for the budget.
+        upload_done = threading.Event()
+
+        def upload() -> None:
+            service.create_batch([("b.png", make_png("b", size=(10, 10)))])
+            upload_done.set()
+
+        worker = threading.Thread(target=upload)
+        worker.start()
+        time.sleep(0.3)
+        assert not upload_done.is_set()
+        # While validation waits, existing state stays queryable.
+        assert service.get_batch(batch.batch_id)["total"] == 1
+        assert service.get_job(a_id)["state"] == JobState.RUNNING.value
+
+        # Releasing the first attempt frees the budget and unblocks validation.
+        plans["a"][0].gate.set()
+        wait_until(upload_done.is_set, timeout=5)
+        # The newly registered job renders as soon as its reservation fits.
+        wait_until(lambda: plans["b"][0].started.is_set(), timeout=5)
+        plans["b"][0].gate.set()
+        wait_until(
+            lambda: service.stats()["jobs"].get(JobState.SUCCEEDED.value) == 2, timeout=5
+        )
+        assert service.stats()["pixels_used"] == 0
+        worker.join(timeout=5)
+    finally:
+        release_all(plans)
+        service.shutdown()
+
+
+def test_pixel_budget_reserved_and_returned_on_success_and_failure():
+    renderer = FakeRenderer()
+    ok_plans = renderer.plan("ok", 1)
+    bad_plans = renderer.plan("bad", 1)
+    bad_plans[0].fail = True
+    service = make_service(renderer, slots=2, max_pixels=10_000)
+    try:
+        service.create_batch(
+            [
+                ("ok.png", make_png("ok", size=(40, 30))),   # 1200 pixels
+                ("bad.png", make_png("bad", size=(20, 10))),  # 200 pixels
+            ]
+        )
+        wait_until(lambda: renderer.active == 2)
+        assert service.stats()["pixels_used"] == 1400  # both attempts reserve
+
+        release_all({"ok": ok_plans, "bad": bad_plans})
+        wait_until(lambda: service.stats()["in_flight"] == 0)
+        # A failed attempt returns its reservation just like a successful one.
+        assert service.stats()["pixels_used"] == 0
+        assert service.stats()["pixels_free"] == 10_000
+    finally:
+        release_all({"ok": ok_plans, "bad": bad_plans})
+        service.shutdown()
+
+
+def test_pending_job_dispatched_before_overdue_retry():
+    """When a slot frees, a fitting never-started job beats an overdue retry.
+
+    Budget 300, two slots.  ``big`` (100 px) and ``holder`` (90 px) occupy
+    both slots; a 110 px pending job's validation fits (190 + 110 = 300) but
+    it has no slot.  ``big`` grows overdue, yet its make-up copy cannot run
+    either.  When the holder finishes, the pending job -- not the retry --
+    gets the free slot.
+    """
+    renderer = FakeRenderer()
+    plans = {
+        "big": renderer.plan("big", 2),
+        "holder": renderer.plan("holder", 1),
+        "queued": renderer.plan("queued", 1),
+    }
+    service = make_service(renderer, slots=2, retry_after=0.05, max_pixels=300)
+    try:
+        first = service.create_batch(
+            [
+                ("big.png", make_png("big", size=(10, 10))),
+                ("holder.png", make_png("holder", size=(9, 10))),
+            ]
+        )
+        big_id = first.job_ids[0]
+        wait_until(
+            lambda: plans["big"][0].started.is_set()
+            and plans["holder"][0].started.is_set()
+        )
+        assert service.stats()["pixels_used"] == 190
+
+        second = service.create_batch([("queued.png", make_png("queued", size=(11, 10)))])
+        queued_id = second.job_ids[0]
+        assert service.get_job(queued_id)["pixels"] == 110
+        time.sleep(0.25)
+        assert service.get_job(queued_id)["state"] == JobState.PENDING.value
+        assert renderer.call_count("big") == 1  # overdue, but no slot for retry
+
+        # Holder frees a slot: the pending job wins over the overdue retry.
+        plans["holder"][0].gate.set()
+        wait_until(lambda: plans["queued"][0].started.is_set())
+        assert service.get_job(queued_id)["state"] == JobState.RUNNING.value
+        assert renderer.call_count("big") == 1
+
+        # Ending the first attempt successfully terminates the job, so no
+        # make-up copy can be dispatched when its slot frees; then the queued
+        # job finishes.  Order matters: big first, queued second.
+        plans["big"][0].gate.set()
+        wait_until(lambda: service.get_job(big_id)["state"] == JobState.SUCCEEDED.value)
+        plans["queued"][0].gate.set()
+        wait_until(lambda: service.stats()["in_flight"] == 0)
+        assert service.stats()["pixels_used"] == 0
+        assert renderer.call_count("big") == 1
+    finally:
+        release_all(plans)
+        service.shutdown()
+
+
+def test_retry_gets_free_slot_when_no_pending_job_fits():
+    """With no pending job left, an overdue fitting retry takes the free slot."""
+    renderer = FakeRenderer()
+    plans = {
+        "big": renderer.plan("big", 2),
+        "holder": renderer.plan("holder", 1),
+    }
+    service = make_service(renderer, slots=2, retry_after=0.05, max_pixels=200)
+    try:
+        batch = service.create_batch(
+            [
+                ("big.png", make_png("big", size=(10, 10))),
+                ("holder.png", make_png("holder", size=(10, 10))),
+            ]
+        )
+        big_id = batch.job_ids[0]
+        wait_until(
+            lambda: plans["big"][0].started.is_set()
+            and plans["holder"][0].started.is_set()
+        )
+        time.sleep(0.3)  # big is overdue, but both slots are taken
+        assert renderer.call_count("big") == 1
+
+        plans["holder"][0].gate.set()
+        wait_until(lambda: renderer.call_count("big") == 2)
+        job = service.get_job(big_id)
+        assert job["state"] == JobState.RETRYING.value
+        assert [a["kind"] for a in job["attempts"]] == ["first", "retry"]
+        assert service.stats()["pixels_used"] == 200
+
+        plans["big"][0].gate.set()
+        plans["big"][1].gate.set()
+        wait_until(lambda: service.stats()["in_flight"] == 0)
+        assert service.stats()["pixels_used"] == 0
+    finally:
+        release_all(plans)
+        service.shutdown()
+
+
+def test_retry_blocked_by_pixel_budget_until_room_frees():
+    renderer = FakeRenderer()
+    plans = {
+        "big": renderer.plan("big", 2),
+        "holder": renderer.plan("holder", 1),
+    }
+    # Budget 250: big = 100 px, holder = 150 px (15x10).  Together they fill
+    # the budget, so the overdue make-up copy (another 100 px) is blocked
+    # until the holder finishes and returns its reservation.
+    service = make_service(renderer, slots=3, retry_after=0.05, max_pixels=250)
+    try:
+        first = service.create_batch([("big.png", make_png("big", size=(10, 10)))])
+        big_id = first.job_ids[0]
+        wait_until(lambda: plans["big"][0].started.is_set())
+
+        holder_batch = service.create_batch(
+            [("holder.png", make_png("holder", size=(15, 10)))]
+        )
+        holder_id = holder_batch.job_ids[0]
+        wait_until(lambda: plans["holder"][0].started.is_set())
+        assert service.stats()["pixels_used"] == 250
+
+        # The holder stays blocked on its gate while "big" grows well past the
+        # retry threshold: overdue, free slot, but no 100 px available.
+        time.sleep(0.3)
+        assert renderer.call_count("big") == 1
+        assert service.get_job(big_id)["state"] == JobState.RUNNING.value
+
+        # Releasing the holder returns 150 px and the retry starts.
+        plans["holder"][0].gate.set()
+        wait_until(
+            lambda: service.get_job(holder_id)["state"] == JobState.SUCCEEDED.value
+        )
+        wait_until(lambda: renderer.call_count("big") == 2)
+        retry_attempt = service.get_job(big_id)["attempts"][1]
+        assert retry_attempt["kind"] == AttemptKind.RETRY.value
+        assert retry_attempt["pixels"] == 100
+
+        plans["big"][0].gate.set()
+        plans["big"][1].gate.set()
+        wait_until(lambda: service.stats()["in_flight"] == 0)
+        assert service.stats()["pixels_used"] == 0
+    finally:
+        release_all(plans)
+        service.shutdown()
+
+
+def test_retry_runs_when_budget_fits_two_copies():
+    renderer = FakeRenderer()
+    plans = {"a": renderer.plan("a", 2)}
+    service = make_service(renderer, slots=3, retry_after=0.05, max_pixels=200)
+    try:
+        job_id = service.create_batch([("a.png", make_png("a", size=(10, 10)))]).job_ids[0]
+        wait_until(lambda: renderer.call_count("a") == 2)
+        # Both copies hold reservations at once.
+        assert service.stats()["pixels_used"] == 200
+        job = service.get_job(job_id)
+        assert [a["kind"] for a in job["attempts"]] == ["first", "retry"]
+        release_all(plans)
+        wait_until(lambda: service.stats()["in_flight"] == 0)
+        assert service.stats()["pixels_used"] == 0
+    finally:
+        release_all(plans)
+        service.shutdown()
+
+
+def test_shutdown_unblocks_validation_waiting_for_budget():
+    renderer = FakeRenderer()
+    plans = {"a": renderer.plan("a", 1)}
+    service = make_service(renderer, slots=2, max_pixels=100)
+    try:
+        service.create_batch([("a.png", make_png("a", size=(10, 10)))])
+        wait_until(lambda: plans["a"][0].started.is_set())
+        assert service.stats()["pixels_used"] == 100
+
+        error: list = []
+
+        def upload() -> None:
+            try:
+                service.create_batch([("b.png", make_png("b", size=(10, 10)))])
+            except RuntimeError as exc:
+                error.append(exc)
+
+        worker = threading.Thread(target=upload)
+        worker.start()
+        time.sleep(0.2)
+        assert worker.is_alive()
+
+        service.shutdown()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert error and "shutting down" in str(error[0])
+        # Prevent the still-gated render from raising a 15 s gate timeout.
+        release_all(plans)
+    finally:
+        release_all(plans)
+        service.shutdown()
+
+
+def test_stats_reports_pixel_budget_limit_and_usage():
+    renderer = FakeRenderer()
+    plans = {"a": renderer.plan("a", 1)}
+    service = make_service(renderer, slots=2, max_pixels=321)
+    try:
+        stats = service.stats()
+        assert stats["max_pixels"] == 321
+        assert stats["pixels_used"] == 0
+        assert stats["pixels_free"] == 321
+
+        service.create_batch([("a.png", make_png("a", size=(4, 4)))])
+        wait_until(lambda: plans["a"][0].started.is_set())
+        stats = service.stats()
+        assert stats["max_pixels"] == 321
+        assert stats["pixels_used"] == 16
+        assert stats["pixels_free"] == 305
+
+        plans["a"][0].gate.set()
+        wait_until(lambda: service.stats()["pixels_used"] == 0)
     finally:
         release_all(plans)
         service.shutdown()
